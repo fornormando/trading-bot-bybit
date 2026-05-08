@@ -1,0 +1,518 @@
+"""
+Bot de Trading Automatizado - Bybit Testnet BTC/USDT
+Estratégia: Didi Index + DMI + Bollinger Bands + Stochastic + MACD
+Conta: FUND (onde ficam os ativos spot na Bybit)
+Autor: Assistente Claude
+Data: 2026-01-29
+"""
+
+import ccxt
+import pandas as pd
+import numpy as np
+import time
+import requests
+import hmac
+import hashlib
+from datetime import datetime
+import logging
+from typing import Dict, Optional
+
+# ==================== CONFIGURAÇÃO DE LOGGING ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==================== CLASSE PRINCIPAL DO BOT ====================
+class BybitTradingBot:
+    """
+    Bot de trading automatizado para Bybit com estratégia multi-indicadores
+    """
+    
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
+        """
+        Inicializa o bot com as credenciais da API
+        
+        Args:
+            api_key: Chave da API Bybit
+            api_secret: Segredo da API Bybit
+            testnet: Se True, usa a conta testnet; se False, usa conta real
+        """
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.testnet = testnet
+        self.base_url = 'https://api-testnet.bybit.com' if testnet else 'https://api.bybit.com'
+        
+        # Configurações de trading
+        self.symbol = 'BTC/USDT'
+        self.max_investment = 1000  # USD máximo por operação
+        self.primary_timeframe = '5m'  # Timeframe principal para decisões
+        
+        # Estado do bot
+        self.in_position = False
+        self.entry_price = 0
+        self.position_size = 0
+        
+        # Inicializa exchange
+        self.exchange = self._initialize_exchange()
+        
+        logger.info(f"Bot inicializado em modo {'TESTNET' if testnet else 'PRODUCAO'}")
+        logger.info(f"Conta: FUND (Bybit Spot)")
+    
+    def _initialize_exchange(self) -> ccxt.bybit:
+        """
+        Inicializa a conexão com a exchange Bybit
+        
+        Returns:
+            Objeto ccxt.bybit configurado
+        """
+        try:
+            exchange = ccxt.bybit({
+                'apiKey': self.api_key,
+                'secret': self.api_secret,
+                'enableRateLimit': True,
+                'options': {'defaultType': 'spot'}
+            })
+            
+            if self.testnet:
+                exchange.set_sandbox_mode(True)
+                exchange.urls['api'] = {
+                    'public': self.base_url,
+                    'private': self.base_url,
+                }
+                logger.info("Modo TESTNET ativado")
+            
+            # Testa conexão
+            ticker = exchange.fetch_ticker(self.symbol)
+            logger.info(f"Conexao OK - BTC: ${ticker['last']:,.2f}")
+            
+            # Verifica saldo
+            balance = self.get_balance()
+            logger.info(f"Saldo USDT: ${balance['USDT']:,.2f}")
+            logger.info(f"Saldo BTC: {balance['BTC']:.8f}")
+            
+            return exchange
+            
+        except Exception as e:
+            logger.error(f"Erro ao inicializar: {e}")
+            raise
+    
+    def _sign_request(self, params: str) -> str:
+        """
+        Assina requisição para API da Bybit
+        
+        Args:
+            params: String com parâmetros
+            
+        Returns:
+            Assinatura HMAC SHA256
+        """
+        return hmac.new(
+            self.api_secret.encode('utf-8'),
+            params.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+    
+    def get_balance(self) -> Dict[str, float]:
+        """
+        Obtém saldo da conta FUND usando API REST direta
+        
+        Returns:
+            Dicionário com saldos {'USDT': valor, 'BTC': valor}
+        """
+        try:
+            timestamp = str(int(time.time() * 1000))
+            recv_window = "5000"
+            
+            endpoint = "/v5/asset/transfer/query-account-coins-balance"
+            params = f"accountType=FUND&timestamp={timestamp}&recv_window={recv_window}"
+            
+            param_str = timestamp + self.api_key + recv_window + params
+            signature = self._sign_request(param_str)
+            
+            url = f"{self.base_url}{endpoint}?{params}"
+            headers = {
+                'X-BAPI-API-KEY': self.api_key,
+                'X-BAPI-SIGN': signature,
+                'X-BAPI-TIMESTAMP': timestamp,
+                'X-BAPI-RECV-WINDOW': recv_window
+            }
+            
+            response = requests.get(url, headers=headers)
+            data = response.json()
+            
+            balances = {'USDT': 0, 'BTC': 0}
+            
+            if data.get('retCode') == 0:
+                balance_list = data.get('result', {}).get('balance', [])
+                for coin in balance_list:
+                    coin_name = coin.get('coin')
+                    if coin_name in ['USDT', 'BTC']:
+                        balances[coin_name] = float(coin.get('transferBalance', 0))
+            
+            return balances
+            
+        except Exception as e:
+            logger.error(f"Erro ao obter saldo: {e}")
+            return {'USDT': 0, 'BTC': 0}
+    
+    # ==================== FUNÇÕES DE CÁLCULO DE INDICADORES ====================
+    
+    def calculate_didi_index(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calcula Didi Index (3 médias móveis)"""
+        df['MA3'] = df['close'].rolling(window=3).mean()
+        df['MA8'] = df['close'].rolling(window=8).mean()
+        df['MA20'] = df['close'].rolling(window=20).mean()
+        return df
+    
+    def calculate_dmi(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """Calcula DMI (+DI, -DI, ADX)"""
+        df['high_diff'] = df['high'].diff()
+        df['low_diff'] = -df['low'].diff()
+        
+        df['plus_dm'] = np.where(
+            (df['high_diff'] > df['low_diff']) & (df['high_diff'] > 0),
+            df['high_diff'], 0
+        )
+        df['minus_dm'] = np.where(
+            (df['low_diff'] > df['high_diff']) & (df['low_diff'] > 0),
+            df['low_diff'], 0
+        )
+        
+        df['tr'] = pd.concat([
+            df['high'] - df['low'],
+            abs(df['high'] - df['close'].shift()),
+            abs(df['low'] - df['close'].shift())
+        ], axis=1).max(axis=1)
+        
+        df['atr'] = df['tr'].rolling(window=period).mean()
+        df['plus_di'] = 100 * (df['plus_dm'].rolling(window=period).mean() / df['atr'])
+        df['minus_di'] = 100 * (df['minus_dm'].rolling(window=period).mean() / df['atr'])
+        
+        df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
+        df['adx'] = df['dx'].rolling(window=period).mean()
+        
+        return df
+    
+    def calculate_stochastic(self, df: pd.DataFrame, k: int = 14, d: int = 3) -> pd.DataFrame:
+        """Calcula Oscilador Estocástico"""
+        lowest_low = df['low'].rolling(window=k).min()
+        highest_high = df['high'].rolling(window=k).max()
+        
+        df['stoch_k'] = 100 * ((df['close'] - lowest_low) / (highest_high - lowest_low))
+        df['stoch_d'] = df['stoch_k'].rolling(window=d).mean()
+        
+        return df
+    
+    def calculate_macd(self, df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+        """Calcula MACD"""
+        ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
+        ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
+        
+        df['macd'] = ema_fast - ema_slow
+        df['macd_signal'] = df['macd'].ewm(span=signal, adjust=False).mean()
+        df['macd_histogram'] = df['macd'] - df['macd_signal']
+        
+        return df
+    
+    def calculate_bollinger_bands(self, df: pd.DataFrame, period: int = 20, std_dev: int = 2) -> pd.DataFrame:
+        """Calcula Bandas de Bollinger"""
+        df['bb_middle'] = df['close'].rolling(window=period).mean()
+        std = df['close'].rolling(window=period).std()
+        
+        df['bb_upper'] = df['bb_middle'] + (std_dev * std)
+        df['bb_lower'] = df['bb_middle'] - (std_dev * std)
+        
+        return df
+    
+    def calculate_all_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calcula todos os indicadores"""
+        df = self.calculate_didi_index(df)
+        df = self.calculate_dmi(df)
+        df = self.calculate_stochastic(df)
+        df = self.calculate_macd(df)
+        df = self.calculate_bollinger_bands(df)
+        return df
+    
+    # ==================== SINAIS DE ENTRADA ====================
+    
+    def check_didi_buy_signal(self, df: pd.DataFrame) -> bool:
+        """Sinal Didi: MA3 cruza MA8 para cima"""
+        if len(df) < 2:
+            return False
+        
+        current_ma3 = df['MA3'].iloc[-1]
+        current_ma8 = df['MA8'].iloc[-1]
+        prev_ma3 = df['MA3'].iloc[-2]
+        prev_ma8 = df['MA8'].iloc[-2]
+        
+        crossover = (prev_ma3 <= prev_ma8) and (current_ma3 > current_ma8)
+        uptrend = current_ma3 > current_ma8 > df['MA20'].iloc[-1]
+        
+        return crossover or uptrend
+    
+    def check_dmi_trend(self, df: pd.DataFrame) -> bool:
+        """Sinal DMI: Tendência de alta forte"""
+        if len(df) < 2:
+            return False
+        
+        adx = df['adx'].iloc[-1]
+        plus_di = df['plus_di'].iloc[-1]
+        minus_di = df['minus_di'].iloc[-1]
+        
+        return (adx >= 25) and (plus_di > minus_di)
+    
+    def check_bollinger_opening(self, df: pd.DataFrame) -> bool:
+        """Sinal BB: Bandas abrindo (volatilidade aumentando)"""
+        if len(df) < 2:
+            return False
+        
+        current_upper = df['bb_upper'].iloc[-1]
+        current_lower = df['bb_lower'].iloc[-1]
+        prev_upper = df['bb_upper'].iloc[-2]
+        prev_lower = df['bb_lower'].iloc[-2]
+        
+        upper_expanding = current_upper > prev_upper
+        lower_expanding = current_lower < prev_lower
+        
+        return upper_expanding and lower_expanding
+    
+    def check_entry_signals(self, df: pd.DataFrame) -> bool:
+        """Verifica TODOS os sinais de entrada"""
+        didi = self.check_didi_buy_signal(df)
+        dmi = self.check_dmi_trend(df)
+        bb = self.check_bollinger_opening(df)
+        
+        logger.info(f"Sinais Entrada -> Didi: {didi}, DMI: {dmi}, BB: {bb}")
+        
+        return didi and dmi and bb
+    
+    # ==================== SINAIS DE SAÍDA ====================
+    
+    def check_dmi_kick(self, df: pd.DataFrame) -> bool:
+        """Sinal DMI: Reversão de tendência"""
+        if len(df) < 3:
+            return False
+        
+        current_plus = df['plus_di'].iloc[-1]
+        current_minus = df['minus_di'].iloc[-1]
+        prev_plus = df['plus_di'].iloc[-2]
+        prev_minus = df['minus_di'].iloc[-2]
+        
+        was_bullish = prev_plus > prev_minus
+        now_bearish = current_minus > current_plus
+        
+        adx_falling = df['adx'].iloc[-1] < df['adx'].iloc[-2]
+        
+        return (was_bullish and now_bearish) or (adx_falling and df['adx'].iloc[-1] < 20)
+    
+    def check_bollinger_closing(self, df: pd.DataFrame) -> bool:
+        """Sinal BB: Bandas fechando"""
+        if len(df) < 2:
+            return False
+        
+        current_width = df['bb_upper'].iloc[-1] - df['bb_lower'].iloc[-1]
+        prev_width = df['bb_upper'].iloc[-2] - df['bb_lower'].iloc[-2]
+        
+        return current_width < prev_width
+    
+    def check_stochastic_overbought(self, df: pd.DataFrame, threshold: int = 80) -> bool:
+        """Sinal Stoch: Sobrecomprado"""
+        if len(df) < 1:
+            return False
+        
+        k = df['stoch_k'].iloc[-1]
+        d = df['stoch_d'].iloc[-1]
+        
+        return (k > threshold) and (d > threshold)
+    
+    def check_macd_rejection(self, df: pd.DataFrame) -> bool:
+        """Sinal MACD: Rejeição (bearish crossover)"""
+        if len(df) < 2:
+            return False
+        
+        current_macd = df['macd'].iloc[-1]
+        current_signal = df['macd_signal'].iloc[-1]
+        
+        return current_macd < current_signal
+    
+    def check_exit_signals(self, df: pd.DataFrame) -> bool:
+        """Verifica TODOS os sinais de saída"""
+        dmi_kick = self.check_dmi_kick(df)
+        bb_closing = self.check_bollinger_closing(df)
+        stoch_over = self.check_stochastic_overbought(df)
+        macd_rej = self.check_macd_rejection(df)
+        
+        logger.info(f"Sinais Saida -> DMI: {dmi_kick}, BB: {bb_closing}, Stoch: {stoch_over}, MACD: {macd_rej}")
+        
+        return dmi_kick and bb_closing and stoch_over and macd_rej
+    
+    # ==================== FUNÇÕES DE DADOS ====================
+    
+    def fetch_ohlcv(self, timeframe: str, limit: int = 100) -> pd.DataFrame:
+        """Busca dados de velas"""
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(self.symbol, timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
+        except Exception as e:
+            logger.error(f"Erro ao buscar OHLCV: {e}")
+            return pd.DataFrame()
+    
+    def get_current_price(self) -> float:
+        """Obtém preço atual"""
+        try:
+            ticker = self.exchange.fetch_ticker(self.symbol)
+            return ticker['last']
+        except Exception as e:
+            logger.error(f"Erro ao obter preço: {e}")
+            return 0
+    
+    # ==================== FUNÇÕES DE TRADING ====================
+    
+    def calculate_position_size(self, current_price: float, usdt_available: float) -> float:
+        """Calcula tamanho da posição"""
+        max_usdt = min(self.max_investment, usdt_available * 0.95)
+        position_size = max_usdt / current_price
+        return round(position_size, 6)
+    
+    def execute_buy(self, price: float, amount: float) -> bool:
+        """Executa ordem de compra"""
+        try:
+            logger.info(f"COMPRANDO: {amount} BTC @ ${price:,.2f}")
+            
+            order = self.exchange.create_market_buy_order(self.symbol, amount)
+            
+            self.in_position = True
+            self.entry_price = price
+            self.position_size = amount
+            
+            logger.info(f"Compra OK! Order: {order['id']}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erro na compra: {e}")
+            return False
+    
+    def execute_sell(self, price: float, amount: float) -> bool:
+        """Executa ordem de venda"""
+        try:
+            logger.info(f"VENDENDO: {amount} BTC @ ${price:,.2f}")
+            
+            order = self.exchange.create_market_sell_order(self.symbol, amount)
+            
+            pnl = (price - self.entry_price) * amount
+            pnl_pct = ((price - self.entry_price) / self.entry_price) * 100
+            
+            logger.info(f"Venda OK! P&L: ${pnl:.2f} ({pnl_pct:.2f}%)")
+            
+            self.in_position = False
+            self.entry_price = 0
+            self.position_size = 0
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erro na venda: {e}")
+            return False
+    
+    # ==================== LOOP PRINCIPAL ====================
+    
+    def run(self, check_interval: int = 60):
+        """Loop principal do bot"""
+        logger.info("=" * 70)
+        logger.info("BOT DE TRADING INICIADO")
+        logger.info(f"Simbolo: {self.symbol}")
+        logger.info(f"Timeframe: {self.primary_timeframe}")
+        logger.info(f"Max investimento: ${self.max_investment}")
+        logger.info("=" * 70)
+        
+        while True:
+            try:
+                # Busca dados
+                df = self.fetch_ohlcv(self.primary_timeframe, limit=100)
+                
+                if df.empty:
+                    logger.warning("Sem dados. Aguardando...")
+                    time.sleep(check_interval)
+                    continue
+                
+                # Calcula indicadores
+                df = self.calculate_all_indicators(df)
+                df = df.dropna()
+                
+                if len(df) < 30:
+                    logger.warning("Dados insuficientes. Aguardando...")
+                    time.sleep(check_interval)
+                    continue
+                
+                # Info atual
+                current_price = self.get_current_price()
+                
+                logger.info(f"\n{'='*70}")
+                logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
+                logger.info(f"BTC: ${current_price:,.2f}")
+                logger.info(f"Posicao: {'ABERTA' if self.in_position else 'FECHADA'}")
+                
+                if self.in_position:
+                    pnl = (current_price - self.entry_price) * self.position_size
+                    pnl_pct = ((current_price - self.entry_price) / self.entry_price) * 100
+                    logger.info(f"P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)")
+                
+                # Decisão
+                if not self.in_position:
+                    if self.check_entry_signals(df):
+                        balance = self.get_balance()
+                        
+                        if balance['USDT'] >= 10:
+                            size = self.calculate_position_size(current_price, balance['USDT'])
+                            logger.info(f"\n>>> SINAL DE COMPRA <<<")
+                            self.execute_buy(current_price, size)
+                        else:
+                            logger.warning("Saldo insuficiente")
+                    else:
+                        logger.info("Aguardando sinais...")
+                else:
+                    if self.check_exit_signals(df):
+                        logger.info(f"\n>>> SINAL DE VENDA <<<")
+                        self.execute_sell(current_price, self.position_size)
+                    else:
+                        logger.info("Mantendo posicao...")
+                
+                logger.info(f"{'='*70}\n")
+                time.sleep(check_interval)
+                
+            except KeyboardInterrupt:
+                logger.info("\nBot interrompido pelo usuario")
+                break
+            except Exception as e:
+                logger.error(f"Erro: {e}")
+                time.sleep(check_interval)
+        
+        logger.info("Bot finalizado")
+
+
+# ==================== EXECUÇÃO ====================
+if __name__ == "__main__":
+    # SUAS CREDENCIAIS
+    API_KEY = "h8hwJVHC88yb42Hsiz"
+    API_SECRET = "Vk7C6eWIYfGD1Z9WQgh1UoF9gSnWZLZOhYTv"
+    
+    try:
+        bot = BybitTradingBot(
+            api_key=API_KEY,
+            api_secret=API_SECRET,
+            testnet=True
+        )
+        
+        # Inicia o bot (verifica a cada 60 segundos)
+        bot.run(check_interval=60)
+        
+    except Exception as e:
+        logger.error(f"Erro fatal: {e}")
